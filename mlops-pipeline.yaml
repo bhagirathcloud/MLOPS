@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MLOps Pipeline with S3, Lambda, Step Functions, and SageMaker (XGBoost)
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: mlops-demo-bucket-1234567890
+    Description: "Name for the S3 bucket to store CSV files (must be globally unique). CHANGE THIS BEFORE DEPLOYMENT."
+  LambdaFunctionName:
+    Type: String
+    Default: mlops-trigger-lambda
+  StateMachineName:
+    Type: String
+    Default: mlops-pipeline-statemachine
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-04c8b672ed6347082
+    Description: "VPC to deploy Lambda and SageMaker jobs. CHANGE THIS BEFORE DEPLOYMENT."
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: "subnet-04d7b5aa77f005e89,subnet-075fbfdef7cf7300e"
+    Description: "Subnets for Lambda and SageMaker jobs. CHANGE THESE BEFORE DEPLOYMENT."
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Default: "sg-0a598f290e1025fc2"
+    Description: "Security Groups for Lambda and SageMaker jobs. CHANGE THIS BEFORE DEPLOYMENT."
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.m5.large
+    Description: SageMaker instance type for processing and training
+
+Resources:
+  MLOpsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt TriggerLambdaFunction.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: LambdaS3StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: '*'
+
+  TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          def handler(event, context):
+              sfn = boto3.client('stepfunctions')
+              # Construct the state machine ARN dynamically
+              region = context.invoked_function_arn.split(':')[3]
+              account_id = context.invoked_function_arn.split(':')[4]
+              state_machine_name = os.environ['STATE_MACHINE_NAME']
+              state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{state_machine_name}"
+              
+              # Pass S3 event as input to Step Functions
+              response = sfn.start_execution(
+                  stateMachineArn=state_machine_arn,
+                  input=json.dumps(event)
+              )
+              return {'statusCode': 200, 'body': json.dumps('Step Function started')}
+      Environment:
+        Variables:
+          STATE_MACHINE_NAME: !Ref StateMachineName
+      VpcConfig:
+        SecurityGroupIds: !Ref SecurityGroupIds
+        SubnetIds: !Ref SubnetIds
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TriggerLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsSageMakerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateProcessingJob
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:Describe* 
+                  - sagemaker:InvokeEndpoint
+                  - sagemaker:StopProcessingJob
+                  - sagemaker:StopTrainingJob
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: 
+                  - !GetAtt SageMakerExecutionRole.Arn
+
+  MLOpsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref StateMachineName
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "MLOps Pipeline",
+          "StartAt": "PreprocessingJob",
+          "States": {
+            "PreprocessingJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+              "Parameters": {
+                "ProcessingJobName.$": "$.detail.object.key",
+                "AppSpecification": {
+                  "ImageUri": "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
+                },
+                "RoleArn": "${SageMakerExecutionRole.Arn}",
+                "ProcessingInputs": [],
+                "ProcessingOutputConfig": {
+                  "Outputs": []
+                },
+                "ProcessingResources": {
+                  "ClusterConfig": {
+                    "InstanceType": "${SageMakerInstanceType}",
+                    "InstanceCount": 1,
+                    "VolumeSizeInGB": 10
+                  }
+                }
+              },
+              "Next": "TrainingJob"
+            },
+            "TrainingJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+              "Parameters": {
+                "TrainingJobName.$": "$.detail.object.key",
+                "AlgorithmSpecification": {
+                  "TrainingImage": "811284229777.dkr.ecr.${AWS::Region}.amazonaws.com/xgboost:1.5-1",
+                  "TrainingInputMode": "File"
+                },
+                "RoleArn": "${SageMakerExecutionRole.Arn}",
+                "InputDataConfig": [],
+                "OutputDataConfig": {
+                  "S3OutputPath": "s3://${S3BucketName}/output/"
+                },
+                "ResourceConfig": {
+                  "InstanceType": "${SageMakerInstanceType}",
+                  "InstanceCount": 1,
+                  "VolumeSizeInGB": 10
+                },
+                "StoppingCondition": {
+                  "MaxRuntimeInSeconds": 3600
+                }
+              },
+              "Next": "CreateModel"
+            },
+            "CreateModel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createModel",
+              "Parameters": {
+                "ModelName.$": "$.detail.object.key",
+                "PrimaryContainer": {
+                  "Image": "811284229777.dkr.ecr.${AWS::Region}.amazonaws.com/xgboost:1.5-1",
+                  "ModelDataUrl.$": "$.TrainingJob.OutputDataConfig.S3OutputPath"
+                },
+                "ExecutionRoleArn": "${SageMakerExecutionRole.Arn}"
+              },
+              "Next": "CreateEndpointConfig"
+            },
+            "CreateEndpointConfig": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+              "Parameters": {
+                "EndpointConfigName.$": "$.detail.object.key",
+                "ProductionVariants": [
+                  {
+                    "VariantName": "AllTraffic",
+                    "ModelName.$": "$.detail.object.key",
+                    "InitialInstanceCount": 1,
+                    "InstanceType": "${SageMakerInstanceType}"
+                  }
+                ]
+              },
+              "Next": "CreateEndpoint"
+            },
+            "CreateEndpoint": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createEndpoint",
+              "Parameters": {
+                "EndpointName.$": "$.detail.object.key",
+                "EndpointConfigName.$": "$.detail.object.key"
+              },
+              "End": true
+            }
+          }
+        }
+
+Outputs:
+  S3Bucket:
+    Description: S3 bucket for CSV uploads
+    Value: !Ref MLOpsBucket
+  LambdaFunction:
+    Description: Lambda function triggered by S3
+    Value: !Ref TriggerLambdaFunction
+  StateMachine:
+    Description: Step Functions state machine
+    Value: !Ref MLOpsStateMachine
