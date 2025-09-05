@@ -1,0 +1,21 @@
+transaction_id,amount,location,device,customer_age,is_fraud
+1,120.50,New York,Mobile,34,yes
+2,15.00,San Francisco,Desktop,22,no
+3,250.00,London,Tablet,45,yes
+4,80.00,Berlin,Mobile,29,no
+5,500.00,Tokyo,Desktop,38,yes
+6,60.00,Paris,Tablet,31,no
+7,45.25,Boston,Mobile,27,no
+8,300.75,Sydney,Desktop,42,yes
+9,25.00,Toronto,Mobile,19,no
+10,150.00,Madrid,Tablet,33,no
+11,450.00,Mumbai,Desktop,41,yes
+12,35.50,Dublin,Mobile,25,no
+13,600.00,Singapore,Tablet,50,yes
+14,90.00,Amsterdam,Desktop,35,no
+15,220.00,Barcelona,Mobile,39,yes
+16,65.00,Stockholm,Tablet,28,no
+17,380.00,Seoul,Desktop,44,yes
+18,40.00,Vienna,Mobile,24,no
+19,180.00,Oslo,Tablet,37,no
+20,520.00,Bangkok,Desktop,46,yes
