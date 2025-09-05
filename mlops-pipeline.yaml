@@ -4,31 +4,26 @@ Description: MLOps Pipeline with S3, Lambda, Step Functions, and SageMaker (XGBo
 Parameters:
   S3BucketName:
     Type: String
-    Default: mlops-demo-bucket-1234567890
-    Description: "Name for the S3 bucket to store CSV files (must be globally unique). CHANGE THIS BEFORE DEPLOYMENT."
+    Default: mlops-demo-bucket-11712809
+    Description: Name for the S3 bucket to store pipeline files. Must be globally unique.
   LambdaFunctionName:
     Type: String
     Default: mlops-trigger-lambda
   StateMachineName:
     Type: String
     Default: mlops-pipeline-statemachine
-
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Default: vpc-04c8b672ed6347082
-    Description: "VPC to deploy Lambda and SageMaker jobs. CHANGE THIS BEFORE DEPLOYMENT."
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Default: "subnet-04d7b5aa77f005e89,subnet-075fbfdef7cf7300e"
-    Description: "Subnets for Lambda and SageMaker jobs. CHANGE THESE BEFORE DEPLOYMENT."
-  SecurityGroupIds:
-    Type: List<AWS::EC2::SecurityGroup::Id>
-    Default: "sg-0a598f290e1025fc2"
-    Description: "Security Groups for Lambda and SageMaker jobs. CHANGE THIS BEFORE DEPLOYMENT."
-  SageMakerInstanceType:
+  SageMakerProcessingInstanceType:
     Type: String
-    Default: ml.m5.large
-    Description: SageMaker instance type for processing and training
+    Default: ml.t3.medium
+    Description: SageMaker instance type for processing jobs
+  SageMakerTrainingInstanceType:
+    Type: String
+    Default: ml.c4.xlarge
+    Description: SageMaker instance type for training jobs
+  SageMakerEndpointInstanceType:
+    Type: String
+    Default: ml.c4.large
+    Description: SageMaker instance type for endpoints
 
 Resources:
   MLOpsBucket:
@@ -38,7 +33,23 @@ Resources:
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: input/
+                  - Name: suffix
+                    Value: .csv
             Function: !GetAtt TriggerLambdaFunction.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TriggerLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -51,26 +62,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-      Policies:
-        - PolicyName: LambdaS3StepFunctionsPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: 'arn:aws:logs:*:*:*'
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
-              - Effect: Allow
-                Action:
-                  - states:StartExecution
-                Resource: '*'
+        - arn:aws:iam::aws:policy/AdministratorAccess
 
   TriggerLambdaFunction:
     Type: AWS::Lambda::Function
@@ -85,35 +77,53 @@ Resources:
           import os
           import json
           import boto3
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
           def handler(event, context):
-              sfn = boto3.client('stepfunctions')
-              # Construct the state machine ARN dynamically
-              region = context.invoked_function_arn.split(':')[3]
-              account_id = context.invoked_function_arn.split(':')[4]
-              state_machine_name = os.environ['STATE_MACHINE_NAME']
-              state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{state_machine_name}"
-              
-              # Pass S3 event as input to Step Functions
-              response = sfn.start_execution(
-                  stateMachineArn=state_machine_arn,
-                  input=json.dumps(event)
-              )
-              return {'statusCode': 200, 'body': json.dumps('Step Function started')}
+              try:
+                  logger.info("Lambda function started")
+                  
+                  if 'Records' not in event:
+                      logger.error("No Records found in event")
+                      return {'statusCode': 400, 'body': json.dumps('Invalid event structure')}
+                  
+                  for record in event['Records']:
+                      s3_event = record.get('s3', {})
+                      bucket_name = s3_event.get('bucket', {}).get('name')
+                      object_key = s3_event.get('object', {}).get('key')
+                      
+                      if not bucket_name or not object_key:
+                          logger.error("Missing bucket or object key in record")
+                          continue
+                      
+                      sfn = boto3.client('stepfunctions')
+                      state_machine_name = os.environ.get('STATE_MACHINE_NAME')
+                      region = context.invoked_function_arn.split(':')[3]
+                      account_id = context.invoked_function_arn.split(':')[4]
+                      state_machine_arn = f"arn:aws:states:{region}:{account_id}:stateMachine:{state_machine_name}"
+                      
+                      step_input = {
+                          "trigger": "s3_upload",
+                          "timestamp": str(context.aws_request_id)
+                      }
+                      
+                      response = sfn.start_execution(
+                          stateMachineArn=state_machine_arn,
+                          input=json.dumps(step_input)
+                      )
+                      logger.info("Step Functions started successfully")
+                  
+                  return {'statusCode': 200, 'body': json.dumps('Step Function started successfully')}
+                  
+              except Exception as e:
+                  logger.error(f"Error in Lambda function: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps(f'Error: {str(e)}')}
       Environment:
         Variables:
           STATE_MACHINE_NAME: !Ref StateMachineName
-      VpcConfig:
-        SecurityGroupIds: !Ref SecurityGroupIds
-        SubnetIds: !Ref SubnetIds
-
-  LambdaInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt TriggerLambdaFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: s3.amazonaws.com
-      SourceAccount: !Ref 'AWS::AccountId'
-      SourceArn: !Sub 'arn:aws:s3:::${S3BucketName}'
 
   SageMakerExecutionRole:
     Type: AWS::IAM::Role
@@ -126,8 +136,7 @@ Resources:
               Service: sagemaker.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AdministratorAccess
 
   StepFunctionsExecutionRole:
     Type: AWS::IAM::Role
@@ -139,157 +148,176 @@ Resources:
             Principal:
               Service: states.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: StepFunctionsSageMakerPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sagemaker:CreateProcessingJob
-                  - sagemaker:CreateTrainingJob
-                  - sagemaker:CreateModel
-                  - sagemaker:CreateEndpointConfig
-                  - sagemaker:CreateEndpoint
-                  - sagemaker:Describe* 
-                  - sagemaker:InvokeEndpoint
-                  - sagemaker:StopProcessingJob
-                  - sagemaker:StopTrainingJob
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - events:PutTargets
-                  - events:PutRule
-                  - events:DescribeRule
-                  - events:DeleteRule
-                  - events:RemoveTargets
-                  - events:ListTargetsByRule
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                  - logs:CreateLogDelivery
-                  - logs:GetLogDelivery
-                  - logs:UpdateLogDelivery
-                  - logs:DeleteLogDelivery
-                  - logs:ListLogDeliveries
-                  - logs:PutResourcePolicy
-                  - logs:DescribeResourcePolicies
-                  - logs:DescribeLogGroups
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - iam:PassRole
-                Resource: 
-                  - !GetAtt SageMakerExecutionRole.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
 
   MLOpsStateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
       StateMachineName: !Ref StateMachineName
       RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
-      DefinitionString: !Sub |
-        {
-          "Comment": "MLOps Pipeline",
-          "StartAt": "PreprocessingJob",
-          "States": {
-            "PreprocessingJob": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
-              "Parameters": {
-                "ProcessingJobName.$": "$.detail.object.key",
-                "AppSpecification": {
-                  "ImageUri": "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3"
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "MLOps Pipeline",
+            "StartAt": "PreprocessingJob",
+            "States": {
+              "PreprocessingJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+                "Parameters": {
+                  "ProcessingJobName.$": "States.Format('processing-{}', $$.Execution.Name)",
+                  "AppSpecification": {
+                    "ImageUri": "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
+                    "ContainerEntrypoint": ["python3", "/opt/ml/processing/code/preprocess.py"]
+                  },
+                  "RoleArn": "${SageMakerExecutionRole.Arn}",
+                  "ProcessingInputs": [
+                    {
+                      "InputName": "input-1",
+                      "S3Input": {
+                        "S3Uri": "s3://${S3BucketName}/input/",
+                        "LocalPath": "/opt/ml/processing/input",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    },
+                    {
+                      "InputName": "code",
+                      "S3Input": {
+                        "S3Uri": "s3://${S3BucketName}/scripts/preprocess.py",
+                        "LocalPath": "/opt/ml/processing/code",
+                        "S3DataType": "S3Prefix",
+                        "S3InputMode": "File"
+                      }
+                    }
+                  ],
+                  "ProcessingOutputConfig": {
+                    "Outputs": [
+                      {
+                        "OutputName": "output-1",
+                        "S3Output": {
+                          "S3Uri.$": "States.Format('s3://{}/processed-{}/', '${S3BucketName}', $$.Execution.Name)",
+                          "LocalPath": "/opt/ml/processing/output",
+                          "S3UploadMode": "EndOfJob"
+                        }
+                      }
+                    ]
+                  },
+                  "ProcessingResources": {
+                    "ClusterConfig": {
+                      "InstanceType": "${SageMakerProcessingInstanceType}",
+                      "InstanceCount": 1,
+                      "VolumeSizeInGB": 10
+                    }
+                  }
                 },
-                "RoleArn": "${SageMakerExecutionRole.Arn}",
-                "ProcessingInputs": [],
-                "ProcessingOutputConfig": {
-                  "Outputs": []
-                },
-                "ProcessingResources": {
-                  "ClusterConfig": {
-                    "InstanceType": "${SageMakerInstanceType}",
+                "Next": "TrainingJob"
+              },
+              "TrainingJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+                "Parameters": {
+                  "TrainingJobName.$": "States.Format('training-{}', $$.Execution.Name)",
+                  "AlgorithmSpecification": {
+                    "TrainingImage": "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-xgboost:1.5-1",
+                    "TrainingInputMode": "File"
+                  },
+                  "RoleArn": "${SageMakerExecutionRole.Arn}",
+                  "HyperParameters": {
+                    "num_round": "100",
+                    "max_depth": "5",
+                    "eta": "0.2",
+                    "gamma": "4",
+                    "min_child_weight": "6",
+                    "subsample": "0.8",
+                    "objective": "binary:logistic",
+                    "eval_metric": "logloss",
+                    "early_stopping_rounds": "10",
+                    "csv_weights": "0"
+                  },
+                  "InputDataConfig": [
+                    {
+                      "ChannelName": "train",
+                      "DataSource": {
+                        "S3DataSource": {
+                          "S3DataType": "S3Prefix",
+                          "S3Uri.$": "States.Format('{}train.csv', $.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri)",
+                          "S3DataDistributionType": "FullyReplicated"
+                        }
+                      },
+                      "ContentType": "text/csv"
+                    },
+                    {
+                      "ChannelName": "validation", 
+                      "DataSource": {
+                        "S3DataSource": {
+                          "S3DataType": "S3Prefix",
+                          "S3Uri.$": "States.Format('{}validation.csv', $.ProcessingOutputConfig.Outputs[0].S3Output.S3Uri)",
+                          "S3DataDistributionType": "FullyReplicated"
+                        }
+                      },
+                      "ContentType": "text/csv"
+                    }
+                  ],
+                  "OutputDataConfig": {
+                    "S3OutputPath": "s3://${S3BucketName}/output/"
+                  },
+                  "ResourceConfig": {
+                    "InstanceType": "${SageMakerTrainingInstanceType}",
                     "InstanceCount": 1,
                     "VolumeSizeInGB": 10
+                  },
+                  "StoppingCondition": {
+                    "MaxRuntimeInSeconds": 3600
                   }
-                }
-              },
-              "Next": "TrainingJob"
-            },
-            "TrainingJob": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
-              "Parameters": {
-                "TrainingJobName.$": "$.detail.object.key",
-                "AlgorithmSpecification": {
-                  "TrainingImage": "811284229777.dkr.ecr.${AWS::Region}.amazonaws.com/xgboost:1.5-1",
-                  "TrainingInputMode": "File"
                 },
-                "RoleArn": "${SageMakerExecutionRole.Arn}",
-                "InputDataConfig": [],
-                "OutputDataConfig": {
-                  "S3OutputPath": "s3://${S3BucketName}/output/"
+                "Next": "CreateModel"
+              },
+              "CreateModel": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createModel",
+                "Parameters": {
+                  "ModelName.$": "States.Format('model-{}', $$.Execution.Name)",
+                  "PrimaryContainer": {
+                    "Image": "683313688378.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-xgboost:1.5-1",
+                    "ModelDataUrl.$": "$.ModelArtifacts.S3ModelArtifacts"
+                  },
+                  "ExecutionRoleArn": "${SageMakerExecutionRole.Arn}"
                 },
-                "ResourceConfig": {
-                  "InstanceType": "${SageMakerInstanceType}",
-                  "InstanceCount": 1,
-                  "VolumeSizeInGB": 10
+                "Next": "CreateEndpointConfig"
+              },
+              "CreateEndpointConfig": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+                "Parameters": {
+                  "EndpointConfigName.$": "States.Format('config-{}', $$.Execution.Name)",
+                  "ProductionVariants": [
+                    {
+                      "VariantName": "AllTraffic",
+                      "ModelName.$": "States.Format('model-{}', $$.Execution.Name)",
+                      "InitialInstanceCount": 1,
+                      "InstanceType": "${SageMakerEndpointInstanceType}"
+                    }
+                  ]
                 },
-                "StoppingCondition": {
-                  "MaxRuntimeInSeconds": 3600
-                }
+                "Next": "CreateEndpoint"
               },
-              "Next": "CreateModel"
-            },
-            "CreateModel": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sagemaker:createModel",
-              "Parameters": {
-                "ModelName.$": "$.detail.object.key",
-                "PrimaryContainer": {
-                  "Image": "811284229777.dkr.ecr.${AWS::Region}.amazonaws.com/xgboost:1.5-1",
-                  "ModelDataUrl.$": "$.TrainingJob.OutputDataConfig.S3OutputPath"
+              "CreateEndpoint": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:createEndpoint",
+                "Parameters": {
+                  "EndpointName.$": "States.Format('endpoint-{}', $$.Execution.Name)",
+                  "EndpointConfigName.$": "States.Format('config-{}', $$.Execution.Name)"
                 },
-                "ExecutionRoleArn": "${SageMakerExecutionRole.Arn}"
-              },
-              "Next": "CreateEndpointConfig"
-            },
-            "CreateEndpointConfig": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
-              "Parameters": {
-                "EndpointConfigName.$": "$.detail.object.key",
-                "ProductionVariants": [
-                  {
-                    "VariantName": "AllTraffic",
-                    "ModelName.$": "$.detail.object.key",
-                    "InitialInstanceCount": 1,
-                    "InstanceType": "${SageMakerInstanceType}"
-                  }
-                ]
-              },
-              "Next": "CreateEndpoint"
-            },
-            "CreateEndpoint": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::sagemaker:createEndpoint",
-              "Parameters": {
-                "EndpointName.$": "$.detail.object.key",
-                "EndpointConfigName.$": "$.detail.object.key"
-              },
-              "End": true
+                "End": true
+              }
             }
           }
-        }
 
 Outputs:
   S3Bucket:
-    Description: S3 bucket for CSV uploads
+    Description: S3 bucket for pipeline files
     Value: !Ref MLOpsBucket
   LambdaFunction:
     Description: Lambda function triggered by S3
@@ -297,3 +325,4 @@ Outputs:
   StateMachine:
     Description: Step Functions state machine
     Value: !Ref MLOpsStateMachine
+
